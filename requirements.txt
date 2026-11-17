@@ -1,2 +1,3 @@
+# Oldest versions tested in CI (see .github/workflows/ci.yml).
 anthropic>=1.0
-openai>=1.0
+openai>=1.100

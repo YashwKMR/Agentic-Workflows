@@ -14,13 +14,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install ruff==0.16.9 -r requirements.txt
+          python-version: "3.13"
+      - run: pip install ruff==0.16.9
       - run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported Python with the oldest SDKs requirements.txt allows.
+          - python-version: "3.10"
+            sdks: "anthropic==1.0.0 openai==1.100.0"
+          # Newest Python with the newest SDKs.
+          - python-version: "3.13"
+            sdks: ""
+    name: test (Python ${{ matrix.python-version }}, ${{ matrix.sdks || 'latest SDKs' }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements.txt ${{ matrix.sdks }}
       - name: Import-check every workflow (no API calls)
         run: |
           for f in 0*.py; do python -c "import importlib.util as u; s=u.spec_from_file_location('m', '$f'); m=u.module_from_spec(s); s.loader.exec_module(m)"; done
-      - name: Run unit tests
-        run: python -m unittest discover tests
+      - name: Unit and end-to-end tests (fake server, no API key)
+        run: python -m unittest discover tests -v
       - name: Check SDK APIs the code depends on
         run: python .github/scripts/check_sdks.py

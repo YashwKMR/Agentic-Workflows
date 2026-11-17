@@ -13,7 +13,7 @@ Usage:
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from common import banner, call, call_json
+from common import banner, call, call_json, report_usage
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -45,6 +45,8 @@ def research(question: str, max_workers: int = 5) -> str:
         effort="high",
     )
     subtasks = plan["subtasks"][:max_workers]
+    if not subtasks:
+        raise SystemExit("The orchestrator planned no subtasks; nothing to research.")
     for t in subtasks:
         banner(f"  planned: {t['title']}")
 
@@ -72,3 +74,4 @@ def research(question: str, max_workers: int = 5) -> str:
 
 if __name__ == "__main__":
     print(research(" ".join(sys.argv[1:]) or "Should a 10-person startup adopt Kubernetes?"))
+    report_usage()

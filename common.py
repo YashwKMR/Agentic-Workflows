@@ -3,14 +3,20 @@
 Pick a backend with environment variables (first match wins):
 
     LLM_PROVIDER=anthropic | openai | local     explicit choice, or auto-detect:
-    ANTHROPIC_API_KEY=...                       -> anthropic (Claude)
-    OPENAI_API_KEY=...                          -> openai
-    LLM_BASE_URL=http://localhost:11434/v1      -> local (any OpenAI-compatible
-                                                   server: Ollama, vLLM, LM Studio,
-                                                   llama.cpp)
+    ANTHROPIC_API_KEY=...                       -> anthropic (Claude, Messages API)
+    OPENAI_API_KEY=...                          -> openai (Responses API)
+    LLM_BASE_URL=http://localhost:11434/v1      -> local: any OpenAI-compatible
+                                                   server, self-hosted (Ollama,
+                                                   vLLM, LM Studio, llama.cpp) or
+                                                   hosted (DeepSeek, Z.ai, Qwen...),
+                                                   through Chat Completions
 
     LLM_MODEL=...     model name (required for local; optional otherwise)
-    LLM_API_KEY=...   key for a local/self-hosted server, if it needs one
+    LLM_API_KEY=...   key for the local or hosted compatible server, if needed
+
+`LLM_PROVIDER=compatible` is accepted as another name for `local`. Setting
+LLM_BASE_URL together with OPENAI_API_KEY sends OpenAI-format requests to that
+server through Chat Completions, as before.
 
 The workflows only use `call()`, `call_json()` and `Conversation`, so they run
 unchanged on any backend.
@@ -22,15 +28,29 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any
 
-DEFAULT_MODELS = {"anthropic": "claude-opus-5", "openai": "gpt-5"}
+DEFAULT_MODELS = {"anthropic": "claude-opus-5-5", "openai": "gpt-6.1-sol"}
+
+# Claude: if a safety classifier declines a request, the API retries it on the
+# fallback model Anthropic recommends for that refusal category, in the same
+# call. Models without a fallback simply keep the refusal.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+# Anthropic's non-streaming limit; enough for thinking plus a long answer.
+MAX_TOKENS = 16000
 
 
 class RefusalError(RuntimeError):
     """Raised when the model declines the request."""
+
+
+class TruncatedError(RuntimeError):
+    """Raised when a reply is cut off by a token or context limit."""
 
 
 class ConfigError(RuntimeError):
@@ -40,6 +60,8 @@ class ConfigError(RuntimeError):
 def provider() -> str:
     explicit = os.environ.get("LLM_PROVIDER", "").strip().lower()
     if explicit:
+        if explicit == "compatible":
+            return "local"
         if explicit not in ("anthropic", "openai", "local"):
             raise ConfigError(f"LLM_PROVIDER must be anthropic, openai or local, not {explicit!r}")
         return explicit
@@ -53,6 +75,21 @@ def provider() -> str:
         "No LLM configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or "
         "LLM_BASE_URL (+ LLM_MODEL) for a local server. See README.md."
     )
+
+
+def api() -> str:
+    """The wire API the active backend speaks: messages, responses or chat.
+
+    OpenAI's GPT-6 models only support tool calling through the Responses API,
+    so OpenAI itself uses that. Everything else that speaks the OpenAI format
+    uses Chat Completions, because that is what local servers implement.
+    """
+    current = provider()
+    if current == "anthropic":
+        return "messages"
+    if current == "openai" and not os.environ.get("LLM_BASE_URL"):
+        return "responses"
+    return "chat"
 
 
 def is_configured() -> bool:
@@ -71,8 +108,10 @@ def model() -> str:
 
 
 def reset_client_cache() -> None:
-    """Clear cached LLM client (useful when environment variables change or in tests)."""
+    """Clear the cached client and learned server quirks (for tests, or after env changes)."""
     _client.cache_clear()
+    _NO_REASONING.clear()
+    _FORMAT_LEVEL.clear()
 
 
 @cache
@@ -94,6 +133,53 @@ def _client():
 
 
 # --------------------------------------------------------------------------- #
+# Usage: every script ends by printing how many calls and tokens it spent.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Usage:
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+_usage = Usage()
+_usage_lock = threading.Lock()
+_started = time.monotonic()
+
+
+def _record_usage(input_tokens: Any = None, output_tokens: Any = None) -> None:
+    """Count one model call; servers that report no usage count as 0 tokens."""
+    with _usage_lock:
+        _usage.calls += 1
+        _usage.input_tokens += input_tokens if isinstance(input_tokens, int) else 0
+        _usage.output_tokens += output_tokens if isinstance(output_tokens, int) else 0
+
+
+def usage() -> Usage:
+    """A snapshot of the calls and tokens used so far in this process."""
+    with _usage_lock:
+        return Usage(_usage.calls, _usage.input_tokens, _usage.output_tokens)
+
+
+def reset_usage() -> None:
+    global _started
+    with _usage_lock:
+        _usage.calls = _usage.input_tokens = _usage.output_tokens = 0
+    _started = time.monotonic()
+
+
+def report_usage() -> None:
+    """Print calls, tokens and wall time to stderr (stdout stays the result)."""
+    spent = usage()
+    tokens = (f"{spent.input_tokens:,} input + {spent.output_tokens:,} output tokens"
+              if spent.input_tokens or spent.output_tokens else "tokens not reported")
+    print(f"\n[{spent.calls} model calls | {tokens} | {time.monotonic() - _started:.1f}s]",
+          file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
 # Conversation: one multi-turn exchange, optionally with tools.
 # --------------------------------------------------------------------------- #
 
@@ -103,7 +189,7 @@ class ToolCall:
     id: str
     name: str
     input: dict
-    error: str | None = None  # set when the model sent unparseable arguments
+    error: str | None = None  # set when the model sent unusable arguments
 
 
 @dataclass
@@ -112,76 +198,158 @@ class Reply:
     tool_calls: list[ToolCall] = field(default_factory=list)
 
 
+def _parse_arguments(call_id: str, name: str, raw: str | None) -> ToolCall:
+    try:
+        args = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return ToolCall(call_id, name, {}, "arguments were not valid JSON")
+    if not isinstance(args, dict):
+        return ToolCall(call_id, name, {}, "arguments must be a JSON object")
+    return ToolCall(call_id, name, args)
+
+
 class Conversation:
-    """Keeps history in the active provider's native format.
+    """Keeps history in the active backend's native format.
 
     `tools` use Anthropic's shape ({name, description, input_schema}); they are
-    translated for OpenAI-compatible backends.
+    translated for the OpenAI formats.
     """
 
     def __init__(self, system: str | None = None, tools: list[dict] | None = None,
                  effort: str = "medium"):
         self.provider = provider()
+        self.api = api()
         self.system = system
         self.tools = tools or []
         self.effort = effort
-        self.messages: list[dict] = []
-        if system and self.provider != "anthropic":
+        self.messages: list[Any] = []
+        if system and self.api == "chat":
             self.messages.append({"role": "system", "content": system})
 
     def add_user(self, text: str) -> None:
         self.messages.append({"role": "user", "content": text})
 
-    def add_tool_results(self, results: list[tuple[str, str, bool]]) -> None:
-        """results: (tool_call_id, content, is_error) for every call in the last reply."""
-        if self.provider == "anthropic":
+    def add_tool_results(self, results: list[tuple[str, str, bool]],
+                         note: str | None = None) -> None:
+        """results: (tool_call_id, content, is_error) for every call in the last reply.
+
+        `note` is extra text for the model sent with the results, e.g. a
+        warning that the step budget is nearly used up.
+        """
+        if self.api == "messages":
             # All results for one turn go back in a single user message.
-            self.messages.append({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": cid, "content": content, "is_error": err}
-                for cid, content, err in results
-            ]})
+            content: list[dict] = [
+                {"type": "tool_result", "tool_use_id": cid, "content": text, "is_error": err}
+                for cid, text, err in results
+            ]
+            if note:
+                content.append({"type": "text", "text": note})
+            self.messages.append({"role": "user", "content": content})
+            return
+        if self.api == "responses":
+            self.messages += [{"type": "function_call_output", "call_id": cid, "output": text}
+                              for cid, text, _ in results]
         else:
-            for cid, content, _ in results:
-                self.messages.append({"role": "tool", "tool_call_id": cid, "content": content})
+            self.messages += [{"role": "tool", "tool_call_id": cid, "content": text}
+                              for cid, text, _ in results]
+        if note:
+            self.add_user(note)
 
     def send(self, schema: dict | None = None) -> Reply:
-        if self.provider == "anthropic":
-            return self._send_anthropic(schema)
-        return self._send_openai(schema)
+        if self.api == "messages":
+            return self._send_messages(schema)
+        if self.api == "responses":
+            return self._send_responses(schema)
+        return self._send_chat(schema)
 
-    def _send_anthropic(self, schema: dict | None) -> Reply:
+    # -- Claude: Messages API ------------------------------------------------ #
+
+    def _send_messages(self, schema: dict | None) -> Reply:
         output_config: dict[str, Any] = {"effort": self.effort}
         if schema:
             output_config["format"] = {"type": "json_schema", "schema": schema}
         params: dict[str, Any] = {
             "model": model(),
-            "max_tokens": 16000,
+            "max_tokens": MAX_TOKENS,
             "thinking": {"type": "adaptive"},
             "output_config": output_config,
             "messages": self.messages,
-            # Server-side fallback: if a safety classifier declines, the API
-            # re-runs the request on Anthropic's recommended fallback model.
-            "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01"},
-            "extra_body": {"fallbacks": "default"},
+            "betas": [FALLBACK_BETA],
+            "fallbacks": "default",
         }
         if self.system:
             params["system"] = self.system
         if self.tools:
             params["tools"] = self.tools
-        response = _client().messages.create(**params)
+        response = _client().beta.messages.create(**params)
+        _record_usage(response.usage.input_tokens, response.usage.output_tokens)
         if response.stop_reason == "refusal":
             details = response.stop_details
             raise RefusalError(f"Request declined (category: {details.category if details else None})")
-        # Append the full content (incl. thinking blocks), not just the text.
-        self.messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason in ("max_tokens", "model_context_window_exceeded"):
+            raise TruncatedError(f"Reply cut off ({response.stop_reason})")
+
+        # Echo the whole turn back, thinking blocks included, minus what a
+        # server-side fallback replaced (see _history_after_fallback).
+        self.messages.append({"role": "assistant",
+                              "content": _history_after_fallback(response.content)})
+        served = _served_blocks(response.content)
         return Reply(
-            text="".join(b.text for b in response.content if b.type == "text").strip(),
-            tool_calls=[ToolCall(b.id, b.name, b.input)
-                        for b in response.content if b.type == "tool_use"],
+            text="".join(b.text for b in served if b.type == "text").strip(),
+            tool_calls=[ToolCall(b.id, b.name, b.input) for b in served if b.type == "tool_use"],
         )
 
-    def _send_openai(self, schema: dict | None) -> Reply:
-        # Chat Completions, because it is what local servers implement.
+    # -- OpenAI: Responses API ----------------------------------------------- #
+
+    def _send_responses(self, schema: dict | None) -> Reply:
+        params: dict[str, Any] = {
+            "model": model(),
+            "input": self.messages,
+            "reasoning": {"effort": self.effort},
+        }
+        if self.system:
+            params["instructions"] = self.system
+        if self.tools:
+            params["tools"] = [{
+                "type": "function",
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t["input_schema"],
+                # Strict mode needs every property required; our tools have
+                # optional ones, and bad arguments go back to the model anyway.
+                "strict": False,
+            } for t in self.tools]
+        if schema:
+            params["text"] = {"format": {"type": "json_schema", "name": "output",
+                                         "schema": schema, "strict": True}}
+        response = _create_response(params)
+        spent = response.usage
+        _record_usage(spent.input_tokens if spent else None, spent.output_tokens if spent else None)
+        if response.status == "failed":
+            raise RuntimeError(f"Response failed: {response.error.message if response.error else 'unknown error'}")
+        if response.status == "incomplete":
+            reason = response.incomplete_details.reason if response.incomplete_details else None
+            if reason == "content_filter":
+                raise RefusalError("Request declined (content filter)")
+            raise TruncatedError(f"Reply cut off ({reason})")
+
+        texts, calls = [], []
+        for item in response.output:
+            if item.type == "message":
+                for part in item.content:
+                    if part.type == "refusal":
+                        raise RefusalError(f"Request declined: {part.refusal}")
+                    if part.type == "output_text":
+                        texts.append(part.text)
+            elif item.type == "function_call":
+                calls.append(_parse_arguments(item.call_id, item.name, item.arguments))
+        # Output items, reasoning included, go back in as input on the next turn.
+        self.messages += response.output
+        return Reply(text="".join(texts).strip(), tool_calls=calls)
+
+    # -- Local and other compatible servers: Chat Completions ---------------- #
+
+    def _send_chat(self, schema: dict | None) -> Reply:
         params: dict[str, Any] = {"model": model(), "messages": self.messages}
         if self.tools:
             params["tools"] = [{"type": "function", "function": {
@@ -189,28 +357,117 @@ class Conversation:
                 "description": t.get("description", ""),
                 "parameters": t["input_schema"],
             }} for t in self.tools]
-        if schema:
-            params["response_format"] = {"type": "json_schema", "json_schema": {
-                "name": "output", "schema": schema, "strict": True}}
-        msg = _client().chat.completions.create(**params).choices[0].message
+        response = _create_chat(params, schema)
+        spent = response.usage
+        _record_usage(spent.prompt_tokens if spent else None, spent.completion_tokens if spent else None)
+        choice = response.choices[0]
+        msg = choice.message
         if getattr(msg, "refusal", None):
             raise RefusalError(f"Request declined: {msg.refusal}")
+        if choice.finish_reason == "content_filter":
+            raise RefusalError("Request declined (content filter)")
+        if choice.finish_reason == "length":
+            raise TruncatedError("Reply cut off (length)")
 
-        calls = []
         function_calls = [tc for tc in msg.tool_calls or [] if tc.type == "function"]
-        for tc in function_calls:
-            try:
-                calls.append(ToolCall(tc.id, tc.function.name, json.loads(tc.function.arguments or "{}")))
-            except json.JSONDecodeError:
-                calls.append(ToolCall(tc.id, tc.function.name, {}, "arguments were not valid JSON"))
         assistant: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+        # Some servers need their reasoning echoed back during a tool loop
+        # (DeepSeek's reasoning_content, Gemini's thought signatures).
+        if getattr(msg, "reasoning_content", None):
+            assistant["reasoning_content"] = msg.reasoning_content
         if function_calls:
-            assistant["tool_calls"] = [{
-                "id": tc.id, "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            } for tc in function_calls]
+            assistant["tool_calls"] = []
+            for tc in function_calls:
+                echoed = {"id": tc.id, "type": "function",
+                          "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                if getattr(tc, "extra_content", None):
+                    echoed["extra_content"] = tc.extra_content
+                assistant["tool_calls"].append(echoed)
         self.messages.append(assistant)
-        return Reply(text=(msg.content or "").strip(), tool_calls=calls)
+        return Reply(
+            text=(msg.content or "").strip(),
+            tool_calls=[_parse_arguments(tc.id, tc.function.name, tc.function.arguments)
+                        for tc in function_calls],
+        )
+
+
+def _fallback_index(blocks: list) -> int:
+    return max((i for i, b in enumerate(blocks) if b.type == "fallback"), default=-1)
+
+
+def _served_blocks(blocks: list) -> list:
+    """The blocks from the model that answered: everything after the last fallback."""
+    return list(blocks)[_fallback_index(blocks) + 1:]
+
+
+def _history_after_fallback(blocks: list) -> list:
+    """What to echo back after a server-side fallback.
+
+    Before the last fallback block, only text and fallback blocks are kept;
+    the declined model's thinking and tool calls are dropped, as Anthropic's
+    fallback docs require. With no fallback, everything is kept.
+    """
+    last = _fallback_index(blocks)
+    return [b for i, b in enumerate(blocks) if i >= last or b.type in ("text", "fallback")]
+
+
+# Learned per model at runtime, so each workaround costs one failed call at most.
+_NO_REASONING: set[str] = set()          # models that reject `reasoning`
+_FORMAT_LEVEL: dict[tuple, int] = {}     # (base_url, model) -> first response_format that worked
+_FORMAT_ERROR = re.compile(r"response.?format|json|schema|grammar", re.IGNORECASE)
+
+
+def _create_response(params: dict) -> Any:
+    from openai import BadRequestError
+
+    if params["model"] in _NO_REASONING:
+        params.pop("reasoning", None)
+    try:
+        return _client().responses.create(**params)
+    except BadRequestError as exc:
+        # Non-reasoning models (gpt-4.1 and older) reject the effort setting.
+        if "reasoning" not in params or "reasoning" not in str(exc).lower():
+            raise
+        _NO_REASONING.add(params["model"])
+        params.pop("reasoning")
+        return _client().responses.create(**params)
+
+
+def _create_chat(params: dict, schema: dict | None) -> Any:
+    """Chat Completions, stepping down if the server rejects JSON-schema output.
+
+    Not every compatible server supports `json_schema` (DeepSeek only offers
+    `json_object`), so this tries json_schema, then json_object, then plain
+    text. call_json() validates the result either way.
+    """
+    if not schema:
+        return _client().chat.completions.create(**params)
+    from openai import BadRequestError, UnprocessableEntityError
+
+    ladder: list[dict | None] = [
+        {"type": "json_schema", "json_schema": {"name": "output", "schema": schema, "strict": True}},
+        {"type": "json_object"},
+        None,
+    ]
+    key = (os.environ.get("LLM_BASE_URL"), params["model"])
+    for level in range(_FORMAT_LEVEL.get(key, 0), len(ladder)):
+        attempt = dict(params)
+        if ladder[level]:
+            attempt["response_format"] = ladder[level]
+        try:
+            response = _client().chat.completions.create(**attempt)
+        except (BadRequestError, UnprocessableEntityError) as exc:
+            # Only step down for format errors; anything else (a bad model
+            # name, a prompt too long) is raised as it is.
+            if level == len(ladder) - 1 or not _FORMAT_ERROR.search(str(exc)):
+                raise
+            nxt = ladder[level + 1]
+            print(f"[server rejected response_format {ladder[level]['type']}: {exc}; "
+                  f"retrying with {nxt['type'] if nxt else 'plain text'}]", file=sys.stderr)
+            continue
+        _FORMAT_LEVEL[key] = level
+        return response
+    raise AssertionError("unreachable")
 
 
 # --------------------------------------------------------------------------- #
@@ -270,19 +527,22 @@ _TYPES = {
 }
 
 
+def _matches(value: Any, expected: str) -> bool:
+    if expected not in _TYPES:
+        return True  # unknown type names are not checked
+    if expected in ("integer", "number") and isinstance(value, bool):
+        return False  # bool is an int subclass in Python, but not in JSON
+    return isinstance(value, _TYPES[expected])
+
+
 def _validate(value: Any, schema: dict, path: str = "$") -> None:
     """Minimal JSON Schema check: type, enum, required, properties, items."""
     expected = schema.get("type")
-    if expected:
-        if isinstance(expected, list):
-            types_tuple = tuple(t for exp in expected if exp in _TYPES for t in ((_TYPES[exp],) if not isinstance(_TYPES[exp], tuple) else _TYPES[exp]))
-            if not isinstance(value, types_tuple) or (any(t in ("integer", "number") for t in expected) and isinstance(value, bool) and "boolean" not in expected):
-                raise ValueError(f"{path} should be one of {expected}")
-        elif expected in _TYPES:
-            if not isinstance(value, _TYPES[expected]) or (
-                expected in ("integer", "number") and isinstance(value, bool)
-            ):
-                raise ValueError(f"{path} should be {expected}")
+    if isinstance(expected, list):
+        if not any(_matches(value, t) for t in expected):
+            raise ValueError(f"{path} should be one of {expected}")
+    elif expected and not _matches(value, expected):
+        raise ValueError(f"{path} should be {expected}")
     if "enum" in schema and value not in schema["enum"]:
         raise ValueError(f"{path} must be one of {schema['enum']}")
     if isinstance(value, dict):

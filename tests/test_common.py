@@ -27,18 +27,21 @@ class TestCommonConfig(unittest.TestCase):
     def test_provider_auto_detect_anthropic(self):
         self.assertTrue(common.is_configured())
         self.assertEqual(common.provider(), "anthropic")
-        self.assertEqual(common.model(), "claude-opus-5")
+        self.assertEqual(common.model(), common.DEFAULT_MODELS["anthropic"])
+        self.assertEqual(common.api(), "messages")
 
     @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-openai-test"}, clear=True)
     def test_provider_auto_detect_openai(self):
         self.assertTrue(common.is_configured())
         self.assertEqual(common.provider(), "openai")
-        self.assertEqual(common.model(), "gpt-5")
+        self.assertEqual(common.model(), common.DEFAULT_MODELS["openai"])
+        self.assertEqual(common.api(), "responses")
 
     @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:11434/v1"}, clear=True)
     def test_provider_auto_detect_local(self):
         self.assertTrue(common.is_configured())
         self.assertEqual(common.provider(), "local")
+        self.assertEqual(common.api(), "chat")
         with self.assertRaises(common.ConfigError):
             common.model()
 
@@ -51,6 +54,17 @@ class TestCommonConfig(unittest.TestCase):
     def test_explicit_provider_override(self):
         self.assertEqual(common.provider(), "openai")
         self.assertEqual(common.model(), "custom-gpt")
+
+    @patch.dict(os.environ, {"LLM_PROVIDER": "compatible", "LLM_BASE_URL": "https://api.deepseek.com"}, clear=True)
+    def test_compatible_is_an_alias_for_local(self):
+        self.assertEqual(common.provider(), "local")
+        self.assertEqual(common.api(), "chat")
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test", "LLM_BASE_URL": "https://proxy.example/v1"}, clear=True)
+    def test_openai_key_with_base_url_uses_chat_completions(self):
+        # A custom server may not implement the Responses API.
+        self.assertEqual(common.provider(), "openai")
+        self.assertEqual(common.api(), "chat")
 
 
 class TestCommonJsonHelpers(unittest.TestCase):
@@ -116,6 +130,14 @@ class TestCommonJsonHelpers(unittest.TestCase):
         with self.assertRaises(ValueError):
             common._validate({"note": 123}, schema)
 
+    def test_validate_union_with_number_rejects_bool(self):
+        schema = {"type": ["integer", "null"]}
+        common._validate(3, schema)
+        common._validate(None, schema)
+        with self.assertRaises(ValueError):
+            common._validate(True, schema)
+        common._validate(True, {"type": ["boolean", "integer"]})
+
 
 class TestConversation(unittest.TestCase):
     @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True)
@@ -123,11 +145,21 @@ class TestConversation(unittest.TestCase):
         common.reset_client_cache()
         conv = common.Conversation(system="system prompt")
         conv.add_user("hello")
-        self.assertEqual(conv.messages[0], {"role": "system", "content": "system prompt"})
-        self.assertEqual(conv.messages[1], {"role": "user", "content": "hello"})
+        # The Responses API takes the system prompt as `instructions`, not as a message.
+        self.assertEqual(conv.messages, [{"role": "user", "content": "hello"}])
 
         conv.add_tool_results([("call_1", "result_1", False)])
-        self.assertEqual(conv.messages[2], {"role": "tool", "tool_call_id": "call_1", "content": "result_1"})
+        self.assertEqual(conv.messages[1],
+                         {"type": "function_call_output", "call_id": "call_1", "output": "result_1"})
+
+    @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:11434/v1", "LLM_MODEL": "m"}, clear=True)
+    def test_chat_conversation_tool_results(self):
+        common.reset_client_cache()
+        conv = common.Conversation(system="system prompt")
+        self.assertEqual(conv.messages[0], {"role": "system", "content": "system prompt"})
+        conv.add_tool_results([("call_1", "result_1", False)], note="one step left")
+        self.assertEqual(conv.messages[1], {"role": "tool", "tool_call_id": "call_1", "content": "result_1"})
+        self.assertEqual(conv.messages[2], {"role": "user", "content": "one step left"})
 
     @patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True)
     def test_anthropic_conversation_tool_results(self):
@@ -135,11 +167,12 @@ class TestConversation(unittest.TestCase):
         conv = common.Conversation(system="system prompt")
         self.assertEqual(conv.messages, [])
         conv.add_user("hello")
-        conv.add_tool_results([("call_1", "res", False)])
+        conv.add_tool_results([("call_1", "res", False)], note="one step left")
         self.assertEqual(conv.messages[1]["role"], "user")
         self.assertEqual(
             conv.messages[1]["content"],
-            [{"type": "tool_result", "tool_use_id": "call_1", "content": "res", "is_error": False}],
+            [{"type": "tool_result", "tool_use_id": "call_1", "content": "res", "is_error": False},
+             {"type": "text", "text": "one step left"}],
         )
 
 

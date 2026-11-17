@@ -12,7 +12,7 @@ Usage:
 
 import sys
 
-from common import banner, call, call_json
+from common import banner, call, call_json, report_usage
 
 GATE_SCHEMA = {
     "type": "object",
@@ -67,3 +67,4 @@ def chain(topic: str, max_outline_attempts: int = 2) -> str:
 
 if __name__ == "__main__":
     print(chain(" ".join(sys.argv[1:]) or "Why vector databases matter for RAG"))
+    report_usage()
