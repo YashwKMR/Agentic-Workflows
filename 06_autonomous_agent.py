@@ -16,11 +16,13 @@ import csv
 import json
 import operator
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
-from common import Conversation, banner
+from common import Conversation, banner, report_usage
 
 SANDBOX = Path(__file__).parent / "sandbox"
+MAX_ROWS = 1000
 
 TOOLS = [
     {
@@ -30,12 +32,14 @@ TOOLS = [
     },
     {
         "name": "read_csv",
-        "description": "Read a CSV file from the workspace. Returns up to `limit` rows as JSON.",
+        "description": "Read a CSV file from the workspace. Returns its columns, the total "
+        "row count, and up to `limit` rows. If total_rows is larger than returned_rows, "
+        "you are not seeing every row: read again with a higher limit before computing totals.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "filename": {"type": "string", "description": "Name from list_files"},
-                "limit": {"type": "integer", "description": "Max rows (default 200)"},
+                "limit": {"type": "integer", "description": f"Max rows (default 200, max {MAX_ROWS})"},
             },
             "required": ["filename"],
             "additionalProperties": False,
@@ -53,6 +57,12 @@ TOOLS = [
         },
     },
 ]
+
+SYSTEM = (
+    "You are a careful data analyst. Explore the workspace with tools, "
+    "use `calculate` for every arithmetic step, and cite the numbers "
+    "behind your conclusion."
+)
 
 _OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
@@ -93,11 +103,20 @@ def run_tool(name: str, args: dict) -> str:
         if path.parent != SANDBOX.resolve() or not path.is_file():
             raise ValueError(f"no such file in workspace: {filename}")
         limit = args.get("limit", 200)
-        if not isinstance(limit, int) or limit < 0:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        limit = min(limit, MAX_ROWS)
         with path.open(newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        return json.dumps(rows[:limit])
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        # Saying how many rows exist stops the model from summing a partial
+        # file and reporting it as the total.
+        return json.dumps({
+            "columns": reader.fieldnames or [],
+            "total_rows": len(rows),
+            "returned_rows": min(limit, len(rows)),
+            "rows": rows[:limit],
+        })
     if name == "calculate":
         expr = args.get("expression")
         if not expr or not isinstance(expr, str) or not expr.strip():
@@ -106,35 +125,44 @@ def run_tool(name: str, args: dict) -> str:
     raise ValueError(f"unknown tool: {name}")
 
 
-def agent(task: str, max_steps: int = 15) -> str:
-    conv = Conversation(
-        system=(
-            "You are a careful data analyst. Explore the workspace with tools, "
-            "use `calculate` for every arithmetic step, and cite the numbers "
-            "behind your conclusion."
-        ),
-        tools=TOOLS,
-    )
+def run_agent(task: str, *, system: str, tools: list[dict],
+              execute: Callable[[str, dict], str], max_steps: int = 15,
+              name: str = "Agent") -> str:
+    """The agent loop: send, run every tool the model asked for, send the results back.
+
+    Pattern 7 reuses this loop for each member of its team.
+    """
+    conv = Conversation(system=system, tools=tools)
     conv.add_user(task)
 
     for step in range(1, max_steps + 1):
         reply = conv.send()
         if not reply.tool_calls:
             return reply.text
+        if step == max_steps:
+            break
 
         results = []
         for call in reply.tool_calls:
-            banner(f"Step {step}: {call.name}({json.dumps(call.input)})")
+            banner(f"{name} step {step}: {call.name}({json.dumps(call.input)})")
             try:
                 if call.error:
                     raise ValueError(call.error)
-                results.append((call.id, run_tool(call.name, call.input), False))
+                results.append((call.id, execute(call.name, call.input), False))
             except TOOL_ERRORS as exc:  # report tool errors back so the model can recover
                 results.append((call.id, f"Error: {exc}", True))
-        conv.add_tool_results(results)
+        # One step left: ask for an answer instead of stopping with nothing.
+        note = ("You have one step left. Reply with your final answer now, using what "
+                "you have; further tool calls will not run.") if step == max_steps - 1 else None
+        conv.add_tool_results(results, note=note)
 
     return f"Stopped: step budget of {max_steps} exhausted before the task finished."
 
 
+def agent(task: str, max_steps: int = 15) -> str:
+    return run_agent(task, system=SYSTEM, tools=TOOLS, execute=run_tool, max_steps=max_steps)
+
+
 if __name__ == "__main__":
     print(agent(" ".join(sys.argv[1:]) or "Which region had the highest total revenue, and by how much?"))
+    report_usage()

@@ -12,7 +12,7 @@ Usage:
 
 import sys
 
-from common import banner, call, call_json
+from common import banner, call, call_json, report_usage
 
 CRITERIA = [
     "correct for all valid inputs, including edge cases",
@@ -68,3 +68,4 @@ def optimize(task: str, max_rounds: int = 4) -> str:
 
 if __name__ == "__main__":
     print(optimize(" ".join(sys.argv[1:]) or "parse ISO-8601 durations like P3DT4H into seconds"))
+    report_usage()

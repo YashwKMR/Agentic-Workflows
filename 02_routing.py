@@ -12,7 +12,7 @@ Usage:
 
 import sys
 
-from common import banner, call, call_json
+from common import banner, call, call_json, report_usage
 
 ROUTES = {
     "billing": (
@@ -61,3 +61,4 @@ def route(ticket: str) -> str:
 
 if __name__ == "__main__":
     print(route(" ".join(sys.argv[1:]) or "I was charged twice for my subscription this month"))
+    report_usage()
